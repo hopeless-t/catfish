@@ -1,0 +1,17 @@
+[project]
+name = "catfish-web-worker"
+version = "0.3.0"
+description = "Self-hosted thin control plane for web workers"
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.0,<2"]
+
+[project.scripts]
+catfish = "catfish.server:main"
+catfish-mcp = "catfish.mcp_server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["catfish"]

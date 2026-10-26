@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+runs/*
+!runs/.gitkeep
+
+.venv/
+
+profiles/*
+!profiles/.gitkeep
+
+*.egg-info/
