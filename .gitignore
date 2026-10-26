@@ -9,3 +9,9 @@ profiles/*
 !profiles/.gitkeep
 
 *.egg-info/
+node_modules/
+public-app/node_modules/
+public-app/dist/
+public-app/.xmcp/
+public-app/xmcp-env.d.ts
+.DS_Store

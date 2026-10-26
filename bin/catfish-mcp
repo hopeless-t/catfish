@@ -1,5 +1,7 @@
 #!/bin/sh
-export PATH="/home/tonegawa/.local/bin:/usr/local/bin:/usr/bin:/bin"
-export CATFISH_AGENT_BROWSER="/home/tonegawa/.local/bin/agent-browser"
-export CATFISH_CURL="/home/tonegawa/.local/bin/curl"
-exec /home/tonegawa/catfish/.venv/bin/catfish-mcp
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+export CATFISH_AGENT_BROWSER="${CATFISH_AGENT_BROWSER:-$(command -v agent-browser)}"
+export CATFISH_CURL="${CATFISH_CURL:-$(command -v curl)}"
+exec "$ROOT/.venv/bin/catfish-mcp"

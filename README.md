@@ -80,3 +80,19 @@ Exposed tools: `catfish_search`, `catfish_fetch`, `catfish_browser_open`, `catfi
 Open responses include `cdp_url`, a loopback WebSocket endpoint for direct Playwright/Puppeteer/CDP use. `catfish_browser_session` returns title/url/profile/cdp_url. The HTTP service intentionally binds `127.0.0.1`; do not expose it publicly without a real auth/TLS boundary because CDP is full browser control.
 
 `browser_action` also supports `eval` for page-context JavaScript. Mutating actions remain non-retrying.
+
+## Public MCP
+
+`public-app/` is the internet-facing, read-only edition built with xmcp. It exposes only:
+
+- `catfish_search`
+- `catfish_fetch`
+- `catfish_about`
+
+Browser sessions, persistent profiles, page `eval`, and raw CDP stay in the local edition and are intentionally excluded from the public service.
+
+The public service is designed to fail closed on private/local network fetches and validates redirects before following them.
+
+## License
+
+MIT. Copyright (c) 2026 hopeless-t.

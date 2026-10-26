@@ -1,0 +1,21 @@
+{
+  "name": "catfish-public",
+  "version": "0.1.0",
+  "description": "Public read-only MCP surface for CATFISH web search and fetch",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "xmcp build",
+    "dev": "xmcp dev",
+    "start": "node dist/http.js"
+  },
+  "dependencies": {
+    "xmcp": "^1.9.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@xmcp-dev/compiler": "^1.9.0"
+  }
+}
