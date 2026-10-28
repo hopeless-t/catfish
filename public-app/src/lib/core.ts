@@ -18,11 +18,20 @@ const searchInFlight = new Map<string, Promise<any>>();
 
 function decodeHtml(s: string): string {
   return s
-    .replace(/&amp;/g, "&")
+    .replace(/&#x([0-9a-f]+);/gi, (_m, hex) => {
+      const cp = Number.parseInt(hex, 16);
+      return Number.isFinite(cp) && cp <= 0x10ffff ? String.fromCodePoint(cp) : _m;
+    })
+    .replace(/&#(\d+);/g, (_m, dec) => {
+      const cp = Number.parseInt(dec, 10);
+      return Number.isFinite(cp) && cp <= 0x10ffff ? String.fromCodePoint(cp) : _m;
+    })
+    .replace(/&nbsp;/g, " ")
     .replace(/&quot;/g, '"')
     .replace(/&#39;|&apos;/g, "'")
     .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
 }
 
 function stripTags(s: string): string {
@@ -68,26 +77,28 @@ async function assertPublicUrl(input: string): Promise<URL> {
   return u;
 }
 
-async function readBodyLimited(res: Response): Promise<string> {
-  if (!res.body) return "";
+async function readBodyLimited(res: Response): Promise<{ text: string; bodyBytes: number }> {
+  if (!res.body) return { text: "", bodyBytes: 0 };
   const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  let text = "";
+  let bodyBytes = 0;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     if (!value) continue;
-    total += value.byteLength;
-    if (total > MAX_FETCH_BYTES) throw new Error(`Response exceeds ${MAX_FETCH_BYTES} bytes`);
-    chunks.push(value);
+    bodyBytes += value.byteLength;
+    if (bodyBytes > MAX_FETCH_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw new Error(`Response exceeds ${MAX_FETCH_BYTES} bytes`);
+    }
+    text += decoder.decode(value, { stream: true });
   }
-  const all = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) { all.set(c, off); off += c.byteLength; }
-  return new TextDecoder("utf-8", { fatal: false }).decode(all);
+  text += decoder.decode();
+  return { text, bodyBytes };
 }
 
-export async function safeFetchText(input: string): Promise<{url: string; status: number; contentType: string; text: string}> {
+export async function safeFetchText(input: string): Promise<{url: string; status: number; contentType: string; contentEncoding: string | null; contentLength: number | null; bodyBytes: number; text: string}> {
   let u = await assertPublicUrl(input);
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
     const res = await fetch(u, {
@@ -95,7 +106,6 @@ export async function safeFetchText(input: string): Promise<{url: string; status
       headers: {
         "user-agent": UA,
         "accept": "text/html,text/plain,application/xhtml+xml,application/json;q=0.8,*/*;q=0.3",
-        "accept-encoding": "identity",
       },
       signal: AbortSignal.timeout(12_000),
     });
@@ -105,14 +115,23 @@ export async function safeFetchText(input: string): Promise<{url: string; status
       u = await assertPublicUrl(new URL(loc, u).toString());
       continue;
     }
-    const raw = await readBodyLimited(res);
+    const body = await readBodyLimited(res);
+    const raw = body.text;
     const ct = res.headers.get("content-type") || "";
     let text = raw;
     if (ct.includes("html") || /<html[\s>]/i.test(raw)) text = stripTags(raw);
     else if (ct.includes("json")) {
       try { text = JSON.stringify(JSON.parse(raw), null, 2); } catch { /* keep raw */ }
     }
-    return { url: u.toString(), status: res.status, contentType: ct, text };
+    return {
+      url: u.toString(),
+      status: res.status,
+      contentType: ct,
+      contentEncoding: res.headers.get("content-encoding"),
+      contentLength: Number(res.headers.get("content-length")) || null,
+      bodyBytes: body.bodyBytes,
+      text,
+    };
   }
   throw new Error("Too many redirects");
 }
@@ -130,14 +149,14 @@ function decodeBingRedirect(href: string): string {
   } catch { return href; }
 }
 
-function anchors(html: string): Array<{href: string; title: string; cls: string}> {
-  const out: Array<{href: string; title: string; cls: string}> = [];
+function anchors(html: string): Array<{href: string; title: string; cls: string; inner: string}> {
+  const out: Array<{href: string; title: string; cls: string; inner: string}> = [];
   const re = /<a\b([^>]*?)href=["']([^"']+)["']([^>]*)>([\s\S]*?)<\/a>/gi;
   for (const m of html.matchAll(re)) {
     const attrs = `${m[1]} ${m[3]}`;
     const cls = attrs.match(/class=["']([^"']*)["']/i)?.[1] || "";
     const title = stripTags(m[4]).trim();
-    out.push({ href: decodeHtml(m[2]), title, cls });
+    out.push({ href: decodeHtml(m[2]), title, cls, inner: m[4] });
   }
   return out;
 }
@@ -168,9 +187,14 @@ function genericResults(html: string, provider: "brave"|"yahoo", limit: number) 
   const seen = new Set<string>();
   const out: Array<{title: string; url: string}> = [];
   for (const a of anchors(html)) {
-    if (!a.title || a.title.length > 500) continue;
+    let title = a.title;
+    if (provider === "yahoo") {
+      if (!a.cls.split(/\s+/).includes("sw-Card__titleInner")) continue;
+      const titleMain = a.inner.match(/<h3\b[^>]*class=["'][^"']*\bsw-Card__titleMain\b[^"']*["'][^>]*>([\s\S]*?)<\/h3>/i);
+      if (titleMain) title = stripTags(titleMain[1]).trim();
+    }
+    if (!title || title.length > 500) continue;
     if (provider === "brave" && !a.cls.split(/\s+/).some((x) => x === "l1" || x === "title")) continue;
-    if (provider === "yahoo" && !a.cls.split(/\s+/).includes("sw-Card__titleInner")) continue;
     let u: URL;
     try { u = new URL(a.href); } catch { continue; }
     if (!['http:','https:'].includes(u.protocol)) continue;
@@ -181,7 +205,7 @@ function genericResults(html: string, provider: "brave"|"yahoo", limit: number) 
     const key = u.toString().replace(/\/$/, "");
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ title: a.title, url: u.toString() });
+    out.push({ title, url: u.toString() });
     if (out.length >= limit) break;
   }
   return out;
@@ -202,11 +226,30 @@ function wordTokens(text: string) {
   return (text.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((x) => x.length >= 2 && !QUERY_STOPWORDS.has(x));
 }
 
+function cjkQueryTerms(text: string) {
+  const chunks = text
+    .normalize("NFKC")
+    .toLowerCase()
+    .split(/[\s,.;:!?、。！？・／/\()[\]{}「」『』]+/u)
+    .map((x) => x.trim())
+    .filter(Boolean);
+  if (chunks.length > 1) return chunks;
+  const only = chunks[0] ?? "";
+  const chars = [...only];
+  if (chars.length <= 2) return only ? [only] : [];
+  const grams: string[] = [];
+  for (let i = 0; i < chars.length - 1; i++) grams.push(chars[i] + chars[i + 1]);
+  return grams;
+}
+
 function relevanceCoverage(query: string, results: Array<{title: string; url: string}>) {
-  const queryTerms = [...new Set(wordTokens(query))];
+  const haystack = results.slice(0, 5).map((r) => `${r.title} ${r.url}`).join(" ").normalize("NFKC").toLowerCase();
+  const queryTerms = containsCjk(query)
+    ? [...new Set(cjkQueryTerms(query))]
+    : [...new Set(wordTokens(query))];
   if (!queryTerms.length) return results.length ? 1 : 0;
-  const resultTerms = new Set(wordTokens(results.slice(0, 5).map((r) => `${r.title} ${r.url}`).join(" ")));
-  const matched = queryTerms.filter((term) => resultTerms.has(term)).length;
+  const resultTerms = containsCjk(query) ? null : new Set(wordTokens(haystack));
+  const matched = queryTerms.filter((term) => resultTerms ? resultTerms.has(term) : haystack.includes(term)).length;
   return matched / queryTerms.length;
 }
 
@@ -279,12 +322,12 @@ async function searchProvider(provider: SearchProvider, query: string, limit: nu
         : `https://www.bing.com/search?q=${q}&mkt=en-US&setlang=en-US&cc=US`;
   const started = Date.now();
   const res = await fetch(url, {
-    headers: { "user-agent": SEARCH_UA, "accept-encoding": "identity", "accept": "text/html" },
+    headers: { "user-agent": SEARCH_UA, "accept": "text/html" },
     signal: AbortSignal.timeout(10_000),
   });
   const contentLength = Number(res.headers.get("content-length")) || null;
   const parsed = await readSearchResults(res, provider, limit);
-  return { provider, status: res.status, elapsedMs: Date.now() - started, contentLength, ...parsed };
+  return { provider, status: res.status, elapsedMs: Date.now() - started, contentLength, contentEncoding: res.headers.get("content-encoding"), ...parsed };
 }
 
 function pruneSearchCache(now = Date.now()) {
@@ -312,13 +355,12 @@ async function performWebSearch(q: string, n: number) {
     try {
       const r = await searchProvider(provider, q, n);
       coolDownProvider(provider, r.status);
-      const quality = containsCjk(q) ? null : relevanceCoverage(q, r.results);
-      tried.push({ provider, status: r.status, elapsedMs: r.elapsedMs, results: r.results.length, quality, bodyBytes: r.bodyBytes, contentLength: r.contentLength, earlyStop: r.earlyStop });
+      const quality = relevanceCoverage(q, r.results);
+      tried.push({ provider, status: r.status, elapsedMs: r.elapsedMs, results: r.results.length, quality, bodyBytes: r.bodyBytes, contentLength: r.contentLength, contentEncoding: r.contentEncoding, earlyStop: r.earlyStop });
       if (r.results.length) {
-        const numericQuality = quality ?? 1;
-        if (!best || numericQuality > best.quality) best = { provider, results: r.results, quality: numericQuality };
-        // Bing is the fast path, but only when its top results preserve most query terms.
-        if (provider === "bing" && quality !== null && quality < 0.6) continue;
+        if (!best || quality > best.quality) best = { provider, results: r.results, quality };
+        // Every fallback must preserve the query's meaning; a provider response alone is not success.
+        if (quality < 0.6) continue;
         return { ok: true, query: q, provider, results: r.results, tried };
       }
     } catch (e) {
@@ -326,8 +368,17 @@ async function performWebSearch(q: string, n: number) {
     }
   }
 
-  if (best) return { ok: true, query: q, provider: best.provider, results: best.results, tried, degraded: true };
-  return { ok: false, query: q, provider: null, results: [], tried };
+  if (best && best.quality >= 0.5) {
+    return { ok: true, query: q, provider: best.provider, results: best.results, tried, degraded: true };
+  }
+  return {
+    ok: false,
+    query: q,
+    provider: null,
+    results: [],
+    tried,
+    reason: best ? "no_relevant_results" : "no_results",
+  };
 }
 
 export async function webSearch(query: string, limit = 8) {
