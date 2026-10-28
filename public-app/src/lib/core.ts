@@ -5,6 +5,7 @@ const UA = "CATFISH-Public/0.1 (+https://github.com/hopeless-t/catfish)";
 const MAX_FETCH_BYTES = 1_500_000;
 const MAX_REDIRECTS = 4;
 const PROVIDER_COOLDOWN_MS = 5 * 60_000;
+const SEARCH_PROVIDER_ORDER = ["bing", "brave"] as const;
 const providerCooldownUntil = new Map<"brave"|"bing", number>();
 
 function decodeHtml(s: string): string {
@@ -189,7 +190,7 @@ export async function webSearch(query: string, limit = 8) {
   if (!q) throw new Error("query is required");
   const n = Math.max(1, Math.min(20, Math.trunc(limit || 8)));
   const tried: any[] = [];
-  for (const provider of ["brave","bing"] as const) {
+  for (const provider of SEARCH_PROVIDER_ORDER) {
     const cooldownRemainingMs = providerCoolingDown(provider);
     if (cooldownRemainingMs) {
       tried.push({ provider, skipped: "cooldown", cooldownRemainingMs });
