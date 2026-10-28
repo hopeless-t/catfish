@@ -4,6 +4,8 @@ import net from "node:net";
 const UA = "CATFISH-Public/0.1 (+https://github.com/hopeless-t/catfish)";
 const MAX_FETCH_BYTES = 1_500_000;
 const MAX_REDIRECTS = 4;
+const PROVIDER_COOLDOWN_MS = 5 * 60_000;
+const providerCooldownUntil = new Map<"brave"|"bing", number>();
 
 function decodeHtml(s: string): string {
   return s
@@ -154,6 +156,19 @@ function normalizeResults(html: string, provider: "brave"|"bing", limit: number)
   return out;
 }
 
+function providerCoolingDown(provider: "brave"|"bing", now = Date.now()) {
+  const until = providerCooldownUntil.get(provider) ?? 0;
+  if (until <= now) {
+    providerCooldownUntil.delete(provider);
+    return 0;
+  }
+  return until - now;
+}
+
+function coolDownProvider(provider: "brave"|"bing", status: number) {
+  if (status === 429) providerCooldownUntil.set(provider, Date.now() + PROVIDER_COOLDOWN_MS);
+}
+
 async function searchProvider(provider: "brave"|"bing", query: string, limit: number) {
   const q = encodeURIComponent(query);
   const url = provider === "brave"
@@ -175,8 +190,14 @@ export async function webSearch(query: string, limit = 8) {
   const n = Math.max(1, Math.min(20, Math.trunc(limit || 8)));
   const tried: any[] = [];
   for (const provider of ["brave","bing"] as const) {
+    const cooldownRemainingMs = providerCoolingDown(provider);
+    if (cooldownRemainingMs) {
+      tried.push({ provider, skipped: "cooldown", cooldownRemainingMs });
+      continue;
+    }
     try {
       const r = await searchProvider(provider, q, n);
+      coolDownProvider(provider, r.status);
       tried.push({ provider, status: r.status, elapsedMs: r.elapsedMs, results: r.results.length });
       if (r.results.length) return { ok: true, query: q, provider, results: r.results, tried };
     } catch (e) {
