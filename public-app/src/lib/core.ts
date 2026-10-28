@@ -70,6 +70,9 @@ function isPrivateIp(address: string): boolean {
 async function assertPublicUrl(input: string): Promise<URL> {
   const u = new URL(input);
   if (!['http:', 'https:'].includes(u.protocol)) throw new Error("Only http/https URLs are supported");
+  if (u.username || u.password) throw new Error("Credentials embedded in URLs are not allowed");
+  const expectedPort = u.protocol === "https:" ? "443" : "80";
+  if (u.port && u.port !== expectedPort) throw new Error("Only standard web ports 80/443 are allowed");
   const host = u.hostname.toLowerCase();
   if (host === 'localhost' || host.endsWith('.localhost')) throw new Error("Local/private targets are not allowed");
   const rows = await dns.lookup(host, { all: true, verbatim: true });
