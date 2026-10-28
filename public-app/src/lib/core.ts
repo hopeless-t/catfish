@@ -4,9 +4,17 @@ import net from "node:net";
 const UA = "CATFISH-Public/0.1 (+https://github.com/hopeless-t/catfish)";
 const MAX_FETCH_BYTES = 1_500_000;
 const MAX_REDIRECTS = 4;
+type SearchProvider = "bing" | "yahoo" | "brave";
+
 const PROVIDER_COOLDOWN_MS = 5 * 60_000;
-const SEARCH_PROVIDER_ORDER = ["bing", "brave"] as const;
-const providerCooldownUntil = new Map<"brave"|"bing", number>();
+const SEARCH_UA = "Mozilla/5.0 AppleWebKit/537.36 CATFISH-Public/0.1 (+https://github.com/hopeless-t/catfish)";
+const ASCII_SEARCH_ORDER: readonly SearchProvider[] = ["bing", "yahoo", "brave"];
+const CJK_SEARCH_ORDER: readonly SearchProvider[] = ["yahoo", "bing", "brave"];
+const SEARCH_CACHE_TTL_MS = 2 * 60_000;
+const SEARCH_CACHE_MAX = 128;
+const providerCooldownUntil = new Map<SearchProvider, number>();
+const searchCache = new Map<string, { expiresAt: number; storedAt: number; value: any }>();
+const searchInFlight = new Map<string, Promise<any>>();
 
 function decodeHtml(s: string): string {
   return s
@@ -134,20 +142,42 @@ function anchors(html: string): Array<{href: string; title: string; cls: string}
   return out;
 }
 
-function normalizeResults(html: string, provider: "brave"|"bing", limit: number) {
-  const reject = new Set(["search.brave.com","cdn.search.brave.com","imgs.search.brave.com","tiles.search.brave.com","www.bing.com","bing.com","r.bing.com","go.microsoft.com","support.microsoft.com","account.microsoft.com"]);
+function bingResults(html: string, limit: number) {
+  const out: Array<{title: string; url: string}> = [];
+  const seen = new Set<string>();
+  const blocks = /<li\b[^>]*class=["'][^"']*\bb_algo\b[^"']*["'][^>]*>([\s\S]*?)<\/li>/gi;
+  for (const block of html.matchAll(blocks)) {
+    const match = block[1].match(/<h2[^>]*>\s*<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
+    if (!match) continue;
+    const title = stripTags(match[2]).trim();
+    const href = decodeBingRedirect(decodeHtml(match[1]));
+    let u: URL;
+    try { u = new URL(href); } catch { continue; }
+    if (!title || !['http:','https:'].includes(u.protocol)) continue;
+    u.hash = "";
+    const key = u.toString().replace(/\/$/, "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ title, url: u.toString() });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function genericResults(html: string, provider: "brave"|"yahoo", limit: number) {
   const seen = new Set<string>();
   const out: Array<{title: string; url: string}> = [];
   for (const a of anchors(html)) {
     if (!a.title || a.title.length > 500) continue;
     if (provider === "brave" && !a.cls.split(/\s+/).some((x) => x === "l1" || x === "title")) continue;
-    if (provider === "bing" && a.cls.split(/\s+/).includes("tilk")) continue;
-    let href = provider === "bing" ? decodeBingRedirect(a.href) : a.href;
+    if (provider === "yahoo" && !a.cls.split(/\s+/).includes("sw-Card__titleInner")) continue;
     let u: URL;
-    try { u = new URL(href); } catch { continue; }
+    try { u = new URL(a.href); } catch { continue; }
     if (!['http:','https:'].includes(u.protocol)) continue;
     const host = u.hostname.toLowerCase();
-    if (reject.has(host) || host.endsWith(".bing.com") || host.endsWith(".brave.com")) continue;
+    if (provider === "brave" && (host.endsWith(".brave.com") || host === "search.brave.com")) continue;
+    if (provider === "yahoo" && (host.endsWith(".yahoo.co.jp") || host.endsWith(".yahoo.com") || host.endsWith(".yimg.jp") || host.endsWith(".yahoo-net.jp"))) continue;
+    u.hash = "";
     const key = u.toString().replace(/\/$/, "");
     if (seen.has(key)) continue;
     seen.add(key);
@@ -157,7 +187,30 @@ function normalizeResults(html: string, provider: "brave"|"bing", limit: number)
   return out;
 }
 
-function providerCoolingDown(provider: "brave"|"bing", now = Date.now()) {
+function normalizeResults(html: string, provider: SearchProvider, limit: number) {
+  if (provider === "bing") return bingResults(html, limit);
+  return genericResults(html, provider, limit);
+}
+
+const QUERY_STOPWORDS = new Set(["a","an","and","are","as","at","by","for","from","how","in","is","of","on","or","the","to","what","when","where","which","while","with"]);
+
+function containsCjk(text: string) {
+  return /[\u3040-\u30ff\u3400-\u9fff]/u.test(text);
+}
+
+function wordTokens(text: string) {
+  return (text.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((x) => x.length >= 2 && !QUERY_STOPWORDS.has(x));
+}
+
+function relevanceCoverage(query: string, results: Array<{title: string; url: string}>) {
+  const queryTerms = [...new Set(wordTokens(query))];
+  if (!queryTerms.length) return results.length ? 1 : 0;
+  const resultTerms = new Set(wordTokens(results.slice(0, 5).map((r) => `${r.title} ${r.url}`).join(" ")));
+  const matched = queryTerms.filter((term) => resultTerms.has(term)).length;
+  return matched / queryTerms.length;
+}
+
+function providerCoolingDown(provider: SearchProvider, now = Date.now()) {
   const until = providerCooldownUntil.get(provider) ?? 0;
   if (until <= now) {
     providerCooldownUntil.delete(provider);
@@ -166,18 +219,22 @@ function providerCoolingDown(provider: "brave"|"bing", now = Date.now()) {
   return until - now;
 }
 
-function coolDownProvider(provider: "brave"|"bing", status: number) {
-  if (status === 429) providerCooldownUntil.set(provider, Date.now() + PROVIDER_COOLDOWN_MS);
+function coolDownProvider(provider: SearchProvider, status: number) {
+  if (status === 403 || status === 429) providerCooldownUntil.set(provider, Date.now() + PROVIDER_COOLDOWN_MS);
 }
 
-async function searchProvider(provider: "brave"|"bing", query: string, limit: number) {
+async function searchProvider(provider: SearchProvider, query: string, limit: number) {
   const q = encodeURIComponent(query);
   const url = provider === "brave"
     ? `https://search.brave.com/search?q=${q}&source=web`
-    : `https://www.bing.com/search?q=${q}`;
+    : provider === "yahoo"
+      ? `https://search.yahoo.co.jp/search?p=${q}`
+      : containsCjk(query)
+        ? `https://www.bing.com/search?q=${q}`
+        : `https://www.bing.com/search?q=${q}&mkt=en-US&setlang=en-US&cc=US`;
   const started = Date.now();
   const res = await fetch(url, {
-    headers: { "user-agent": UA, "accept-encoding": "identity", "accept": "text/html" },
+    headers: { "user-agent": SEARCH_UA, "accept-encoding": "identity", "accept": "text/html" },
     signal: AbortSignal.timeout(10_000),
   });
   const html = await readBodyLimited(res);
@@ -185,12 +242,23 @@ async function searchProvider(provider: "brave"|"bing", query: string, limit: nu
   return { provider, status: res.status, elapsedMs: Date.now() - started, results };
 }
 
-export async function webSearch(query: string, limit = 8) {
-  const q = query.trim().replace(/\s+/g, " ");
-  if (!q) throw new Error("query is required");
-  const n = Math.max(1, Math.min(20, Math.trunc(limit || 8)));
+function pruneSearchCache(now = Date.now()) {
+  for (const [key, entry] of searchCache) {
+    if (entry.expiresAt <= now) searchCache.delete(key);
+  }
+  while (searchCache.size > SEARCH_CACHE_MAX) {
+    const oldest = searchCache.keys().next().value;
+    if (oldest === undefined) break;
+    searchCache.delete(oldest);
+  }
+}
+
+async function performWebSearch(q: string, n: number) {
   const tried: any[] = [];
-  for (const provider of SEARCH_PROVIDER_ORDER) {
+  const order = containsCjk(q) ? CJK_SEARCH_ORDER : ASCII_SEARCH_ORDER;
+  let best: { provider: SearchProvider; results: Array<{title: string; url: string}>; quality: number } | null = null;
+
+  for (const provider of order) {
     const cooldownRemainingMs = providerCoolingDown(provider);
     if (cooldownRemainingMs) {
       tried.push({ provider, skipped: "cooldown", cooldownRemainingMs });
@@ -199,11 +267,58 @@ export async function webSearch(query: string, limit = 8) {
     try {
       const r = await searchProvider(provider, q, n);
       coolDownProvider(provider, r.status);
-      tried.push({ provider, status: r.status, elapsedMs: r.elapsedMs, results: r.results.length });
-      if (r.results.length) return { ok: true, query: q, provider, results: r.results, tried };
+      const quality = containsCjk(q) ? null : relevanceCoverage(q, r.results);
+      tried.push({ provider, status: r.status, elapsedMs: r.elapsedMs, results: r.results.length, quality });
+      if (r.results.length) {
+        const numericQuality = quality ?? 1;
+        if (!best || numericQuality > best.quality) best = { provider, results: r.results, quality: numericQuality };
+        // Bing is the fast path, but only when its top results preserve most query terms.
+        if (provider === "bing" && quality !== null && quality < 0.6) continue;
+        return { ok: true, query: q, provider, results: r.results, tried };
+      }
     } catch (e) {
       tried.push({ provider, error: e instanceof Error ? e.message : String(e) });
     }
   }
+
+  if (best) return { ok: true, query: q, provider: best.provider, results: best.results, tried, degraded: true };
   return { ok: false, query: q, provider: null, results: [], tried };
 }
+
+export async function webSearch(query: string, limit = 8) {
+  const q = query.trim().replace(/\s+/g, " ");
+  if (!q) throw new Error("query is required");
+  const n = Math.max(1, Math.min(20, Math.trunc(limit || 8)));
+  const key = `${n}\n${q.toLowerCase()}`;
+  const now = Date.now();
+  pruneSearchCache(now);
+
+  const cached = searchCache.get(key);
+  if (cached && cached.expiresAt > now) {
+    // Refresh insertion order so frequently reused queries survive the bounded cache.
+    searchCache.delete(key);
+    searchCache.set(key, cached);
+    return { ...cached.value, cache: { hit: true, ageMs: now - cached.storedAt } };
+  }
+
+  const existing = searchInFlight.get(key);
+  if (existing) {
+    const value = await existing;
+    return { ...value, cache: { hit: true, coalesced: true } };
+  }
+
+  const work = performWebSearch(q, n);
+  searchInFlight.set(key, work);
+  try {
+    const value = await work;
+    if (value.ok && !value.degraded) {
+      const storedAt = Date.now();
+      searchCache.set(key, { storedAt, expiresAt: storedAt + SEARCH_CACHE_TTL_MS, value });
+      pruneSearchCache(storedAt);
+    }
+    return { ...value, cache: { hit: false } };
+  } finally {
+    searchInFlight.delete(key);
+  }
+}
+
