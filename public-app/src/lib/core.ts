@@ -223,6 +223,51 @@ function coolDownProvider(provider: SearchProvider, status: number) {
   if (status === 403 || status === 429) providerCooldownUntil.set(provider, Date.now() + PROVIDER_COOLDOWN_MS);
 }
 
+function likelyHasEnoughResults(html: string, provider: SearchProvider, limit: number) {
+  const marker = provider === "yahoo" ? "sw-Card__titleInner" : provider === "bing" ? "b_algo" : "result";
+  let count = 0;
+  let at = 0;
+  while (count < limit) {
+    at = html.indexOf(marker, at);
+    if (at < 0) return false;
+    count += 1;
+    at += marker.length;
+  }
+  return true;
+}
+
+async function readSearchResults(res: Response, provider: SearchProvider, limit: number) {
+  if (!res.body) return { results: [], bodyBytes: 0, earlyStop: false };
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  let html = "";
+  let bodyBytes = 0;
+  let nextCheckAt = 64 * 1024;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    bodyBytes += value.byteLength;
+    if (bodyBytes > MAX_FETCH_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw new Error(`Response exceeds ${MAX_FETCH_BYTES} bytes`);
+    }
+    html += decoder.decode(value, { stream: true });
+    if (bodyBytes >= nextCheckAt) {
+      nextCheckAt = bodyBytes + 64 * 1024;
+      if (likelyHasEnoughResults(html, provider, limit)) {
+        const results = normalizeResults(html, provider, limit);
+        if (results.length >= limit) {
+          await reader.cancel().catch(() => {});
+          return { results, bodyBytes, earlyStop: true };
+        }
+      }
+    }
+  }
+  html += decoder.decode();
+  return { results: normalizeResults(html, provider, limit), bodyBytes, earlyStop: false };
+}
+
 async function searchProvider(provider: SearchProvider, query: string, limit: number) {
   const q = encodeURIComponent(query);
   const url = provider === "brave"
@@ -237,9 +282,9 @@ async function searchProvider(provider: SearchProvider, query: string, limit: nu
     headers: { "user-agent": SEARCH_UA, "accept-encoding": "identity", "accept": "text/html" },
     signal: AbortSignal.timeout(10_000),
   });
-  const html = await readBodyLimited(res);
-  const results = normalizeResults(html, provider, limit);
-  return { provider, status: res.status, elapsedMs: Date.now() - started, results };
+  const contentLength = Number(res.headers.get("content-length")) || null;
+  const parsed = await readSearchResults(res, provider, limit);
+  return { provider, status: res.status, elapsedMs: Date.now() - started, contentLength, ...parsed };
 }
 
 function pruneSearchCache(now = Date.now()) {
@@ -268,7 +313,7 @@ async function performWebSearch(q: string, n: number) {
       const r = await searchProvider(provider, q, n);
       coolDownProvider(provider, r.status);
       const quality = containsCjk(q) ? null : relevanceCoverage(q, r.results);
-      tried.push({ provider, status: r.status, elapsedMs: r.elapsedMs, results: r.results.length, quality });
+      tried.push({ provider, status: r.status, elapsedMs: r.elapsedMs, results: r.results.length, quality, bodyBytes: r.bodyBytes, contentLength: r.contentLength, earlyStop: r.earlyStop });
       if (r.results.length) {
         const numericQuality = quality ?? 1;
         if (!best || numericQuality > best.quality) best = { provider, results: r.results, quality: numericQuality };
