@@ -16,6 +16,6 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
-    "@xmcp-dev/compiler": "^1.9.0"
+    "@xmcp-dev/compiler": "^1.12.0"
   }
 }
